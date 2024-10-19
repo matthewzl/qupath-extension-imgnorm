@@ -1,0 +1,25 @@
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+
+# PyCharm settings
+.idea/
+
+# macOS-specific
+.DS_Store
+
+# Distribution / build
+dist/
+build/
+
+# Ancillary python scripts
+hidden/
+
+# pyinstaller-generated
+*.spec
+
