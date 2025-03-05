@@ -5,6 +5,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Comparator;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -15,7 +19,7 @@ public class ImgNormDirectoryManager {
     private File imgTempDir;
     private File newProjDir;
     private File imgFinalDir;
-    final Logger logger = LoggerFactory.getLogger(ImgNormDirectoryManager.class);
+    static final Logger logger = LoggerFactory.getLogger(ImgNormDirectoryManager.class);
 
     public ImgNormDirectoryManager(File projectDir) throws IOException {
         this.mainDir = createUniqueDirectory(projectDir.toString(), "normalized");
@@ -44,6 +48,35 @@ public class ImgNormDirectoryManager {
             path = Paths.get(parentDir, dirName + counter);
         }
         return Files.createDirectory(path).toFile();
+    }
+
+    /**
+     * Delete a directory including its contents
+     *
+     * @param   dir
+     *          the directory
+     *
+     * @return  the success of the operation
+     */
+    public static boolean deleteDirectory(File dir) {
+        Path pathToBeDeleted = dir.toPath();
+        AtomicBoolean success = new AtomicBoolean(true);
+        logger.info("Deleting " + pathToBeDeleted + " and its contents...");
+
+        try (Stream<Path> walk = Files.walk(pathToBeDeleted)) {
+            walk.sorted(Comparator.reverseOrder())
+                    .map(Path::toFile)
+                    .forEach(file -> {
+                        if (!file.delete()) {
+                            success.set(false);
+                            logger.warn("Failed to delete " + file.getAbsolutePath() + " in " + pathToBeDeleted);
+                        }
+                    });
+        } catch (IOException e) {
+            success.set(false);
+            throw new RuntimeException(e.getMessage());
+        }
+        return success.get();
     }
 
     public File getMainDir() {

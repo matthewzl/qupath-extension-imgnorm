@@ -10,9 +10,11 @@ import qupath.lib.color.ColorDeconvolutionStains;
 import qupath.lib.color.StainVector;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.dialogs.Dialogs;
+import qupath.lib.gui.viewer.QuPathViewer;
 import qupath.lib.images.ImageData;
 import qupath.lib.images.servers.ImageServers;
 import qupath.lib.objects.PathObject;
+import qupath.lib.objects.classes.PathClass;
 import qupath.lib.projects.Project;
 import qupath.lib.projects.ProjectImageEntry;
 import qupath.lib.projects.Projects;
@@ -22,6 +24,8 @@ import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +49,38 @@ public class ImgNormRunner implements Runnable {
 
     @Override
     public void run() {
+
+        Project<BufferedImage> project = qupath.getProject();
+        if (project == null){
+            Dialogs.showErrorMessage("Error", "Please make sure a project is loaded!");
+            return;
+        } else if (project.getImageList().isEmpty()){
+            Dialogs.showErrorMessage("Error", "This project has no images!");
+            return;
+        }
+
+        if(!Dialogs.showYesNoDialog("Begin ImgNorm", "Normalize H&E images for this project?" +
+                " The normalized images will be added to a new project.")) return;
+
+        var viewers = qupath.getAllViewers();
+        List<ImageData<BufferedImage>> unsavedImageDataList = viewers.stream()
+                .map(QuPathViewer::getImageData)
+                .filter(Objects::nonNull)
+                .filter(ImageData::isChanged)
+                .toList();
+
+        if(!unsavedImageDataList.isEmpty() && Dialogs.showYesNoDialog("Save changes",
+                "There are unsaved changes in the current " +
+                ((viewers.size() > 1) ? "viewers" : "viewer") + "! Would you like to save before proceeding?")) {
+            for (ImageData<BufferedImage> unsavedImageData : unsavedImageDataList) {
+                try {
+                    project.getEntry(unsavedImageData).saveImageData(unsavedImageData);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+
         ImgNormTask imageProcessingTask = new ImgNormTask();
         ExecutorService pool = Executors.newSingleThreadExecutor();
 
@@ -58,7 +94,7 @@ public class ImgNormRunner implements Runnable {
             progressDialog.getDialogPane().getButtonTypes().add(ButtonType.CANCEL);
             progressDialog.setResizable(true);
 
-            // Resize the progressDialog if the message changes in line number. (This is completely unnecessary...)
+            // Resize the progressDialog if the message changes in line number. (Currently unused)
             imageProcessingTask.messageProperty().addListener((v, o, n) -> {
                 int newlineCount = n.split("\n").length;
                 int oldLineCount = o.split("\n").length;
@@ -72,7 +108,7 @@ public class ImgNormRunner implements Runnable {
                         for (int i = (int)progressDialog.getHeight(); i < newHeight; i++) {
                             progressDialog.setHeight(i);
                             try {
-                                Thread.sleep(100/(newHeight - i)); // "animate" the resizing
+                                Thread.sleep(100/(newHeight - i)); // animate the resizing
                             } catch (InterruptedException e) {
                                 throw new RuntimeException(e);
                             }
@@ -83,7 +119,7 @@ public class ImgNormRunner implements Runnable {
                         for (int i = (int)progressDialog.getHeight(); i > newHeight; i--) {
                             progressDialog.setHeight(i);
                             try {
-                                Thread.sleep(100/(i - newHeight)); // "animate" the resizing
+                                Thread.sleep(100/(i - newHeight)); // animate the resizing
                             } catch (InterruptedException e) {
                                 throw new RuntimeException(e);
                             }
@@ -158,18 +194,9 @@ public class ImgNormRunner implements Runnable {
                 logger.info("Starting ImgNorm...");
                 updateTaskProgress(0, 100);
                 Project<BufferedImage> origProj = qupath.getProject();
-//                Map<File, Collection<PathObject>> origImgFiles = new LinkedHashMap<>(); // <- outdated...
-                Map<File, List<Collection<PathObject>>> origImgFiles = new LinkedHashMap<>();
-                // ^^^ make key of type List<Collection<PathObject>> because the project may have multiple entries (with their own hierarchies) linked to the same image file
+                List<ImgFileData> origImgFiles = new ArrayList<>();
 
-                if (origProj == null){
-                    showErrorMessage("Error", "Please make sure a project is loaded!");
-                    return null;
-                } else if (origProj.getImageList().isEmpty()){
-                    showErrorMessage("Error", "This project has no images!");
-                    return null;
-                }
-
+                updateMessage("Setting up directories...");
                 File projectDir = Projects.getBaseDirectory(origProj);
                 ImgNormDirectoryManager dirManager;
                 try {
@@ -179,34 +206,18 @@ public class ImgNormRunner implements Runnable {
                     return null;
                 }
 
-                updateMessage("Setting up directories...");
-
                 // Create the list of working entries from the current project
-                List<ProjectImageEntry<BufferedImage>> origEntryList = origProj.getImageList().stream()
-                        .filter(entry -> {
-                            try {
-                                Collection<URI> uris = entry.getURIs();
-                                URI firstUri = uris.iterator().next();
-                                //                        System.out.println("Image URI: " + firstUri);
-                                // ensure only one URI is present and image path exists
-                                return (uris.size() == 1 && Files.exists(Paths.get(firstUri)));
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                                return false;
-                            }
-                        })
-                        .toList();
-
+                updateMessage("Gathering image entries...");
+                List<ProjectImageEntry<BufferedImage>> origEntryList = origProj.getImageList();
                 System.out.println("origEntryList: " + origEntryList);
 
                 Platform.runLater(() -> updateTaskProgress(getProgress()*100 + 1, 100));
                 checkAndHandleCancel();
 
-                updateMessage("Writing tiles...");
-
                 // Iterate over the entries, taking their ImageData and creating tiles/patches from them
+                Set<File> duplicateTracker = new HashSet<>();
                 for (ProjectImageEntry<BufferedImage> entry : origEntryList) {
-                    updateMessage("Writing tiles for " + entry);
+                    updateMessage("Opening " + entry);
                     checkAndHandleCancel();
 
                     try {
@@ -214,14 +225,31 @@ public class ImgNormRunner implements Runnable {
 
                         Collection<URI> uris = entry.getURIs();
                         URI firstUri = uris.iterator().next();
+                        if (uris.size() != 1 && !Files.exists(Paths.get(firstUri))) { // skip if URI is invalid
+                            logger.warn("{} was skipped because URI is invalid", entry);
+                            continue;
+                        }
+
+                        ImageData<BufferedImage> entryImageData = entry.readImageData(); // readImageData() can be a costly operation
+                        if (entryImageData.getImageType() != ImageData.ImageType.BRIGHTFIELD_H_E) { // skip if not set to H&E
+                            logger.warn("{} was skipped because image type is not set to Brightfield H&E", entry);
+                            continue;
+                        }
+
                         File entryImgFile = new File(firstUri);
-                        System.out.println("Image URI: " + firstUri);
-                        System.out.println("entryImgFile: " + entryImgFile);
-                        origImgFiles.computeIfAbsent(entryImgFile, k -> new ArrayList<>()).add(ImgNormImageTools.getAnnotationObjects(entry));
-//                        origImgFiles.put(entryImgFile, ImgNormImageTools.getAnnotationObjects(entry)); <- outdated...
+                        ImgFileData imgFileData = new ImgFileData(entryImgFile, entryImageData.getHierarchy().getAnnotationObjects());
+                        origImgFiles.add(imgFileData);
+
+                        // Require all entries with Ignore annotations to have their images tiled even if they share the same image file
+                        // But entries without Ignore annotations that share the same image file can skip tiling if tiling for one has been done already
+                        if (!imgFileData.isHasMod()) {
+                            if (duplicateTracker.contains(entryImgFile)) continue;
+                            duplicateTracker.add(entryImgFile); // same as duplicateTracker.add(imgFileData.getImageFile())
+                        }
 
                         System.gc();
-                        ImgNormImageTools.writeTiles(entry, dirManager.getImgTempDir(), TILE_SIZE_PIXELS);
+                        updateMessage("Writing tiles for " + entry);
+                        ImgNormImageTools.writeTiles(entryImageData, dirManager.getImgTempDir(), TILE_SIZE_PIXELS, imgFileData.getBaseName());
 
                     } catch (RuntimeException | IOException | InterruptedException | OutOfMemoryError e) {
                         logger.error(e.getMessage());
@@ -231,7 +259,7 @@ public class ImgNormRunner implements Runnable {
 
                 System.out.println("origImgFiles: " + origImgFiles);
 
-                // Take the resultant saved tiles, normalize them using Python, and stitch them back to their original dimensions.
+                // Take the resultant saved tiles, normalize them using Python, and stitch them back to their original dimensions
                 checkAndHandleCancel();
                 updateMessage("Initializing normalization algorithm...");
                 ImgNormRunPython pythonRunner = new ImgNormRunPython(dirManager.getImgTempDir(), this, 40.0, false);
@@ -242,7 +270,7 @@ public class ImgNormRunner implements Runnable {
                 updateMessage("Stitching images...");
                 List<File> patchDirectories = new ArrayList<>();
                 Arrays.stream(dirManager.getImgTempDir().listFiles()).toList().forEach(file -> {
-                    if (file.isDirectory()) { // <- this effectively removes any invisible files (they typically aren't directories)
+                    if (file.isDirectory()) { // <- this removes any invisible files (they usually aren't directories)
                         patchDirectories.add(file);
                     }
                 });
@@ -276,14 +304,12 @@ public class ImgNormRunner implements Runnable {
                     Project<BufferedImage> normProj = qupath.getProject();
 
                     // Populate new project with the normalized images
-                    origImgFiles.forEach((origImgFile, annotationsList) -> {
+                    origImgFiles.forEach(imgFileData -> {
                         try {
-                            String origImgFileStr = origImgFile.getName();
-                            // Chop off extension
-                            String origImgFileStrFinal = origImgFileStr.substring(0, origImgFileStr.lastIndexOf("."));
+                            String origImgFileStrFinal =  imgFileData.getBaseName();
                             File normImgFile = null;
 
-                            // Locate the corresponding normalized image via simple string matching
+                            // Locate the corresponding normalized image via string matching
                             for (File file : Objects.requireNonNull(dirManager.getImgFinalDir().listFiles())){
                                 String normImgStr = file.getName();
                                 // Chop off extension
@@ -304,23 +330,19 @@ public class ImgNormRunner implements Runnable {
                                 System.out.println("The original " + origImgFileStrFinal + " is not equal to " + normImgStrFinal);
                             }
 
-                            if (normImgFile != null) { // null shouldn't happen
-
-                                for (Collection<PathObject> annotations : annotationsList) {
-                                    var imageServer = ImageServers.buildServer(normImgFile.toURI());
-                                    ProjectImageEntry<BufferedImage> imageEntryNorm = normProj.addImage(imageServer.getBuilder());
-                                    imageEntryNorm.setImageName(normImgFile.getName());
-                                    var imageDataNorm = imageEntryNorm.readImageData();
-                                    // Set image to H&E
-                                    imageDataNorm.setImageType(ImageData.ImageType.BRIGHTFIELD_H_E);
-                                    // Transfer the annotations from the un-normalized image
-                                    imageDataNorm.getHierarchy().addObjects(annotations);
-                                    // Set image to new stain vectors
-                                    imageDataNorm.setColorDeconvolutionStains(FINAL_STAINS);
-                                    // Save the entry
-                                    imageEntryNorm.saveImageData(imageDataNorm);
-                                }
-
+                            if (normImgFile != null) { // null shouldn't happen because the normalized images should all be located
+                                var imageServer = ImageServers.buildServer(normImgFile.toURI());
+                                ProjectImageEntry<BufferedImage> imageEntryNorm = normProj.addImage(imageServer.getBuilder());
+                                imageEntryNorm.setImageName(normImgFile.getName());
+                                var imageDataNorm = imageEntryNorm.readImageData();
+                                // Set image to H&E
+                                imageDataNorm.setImageType(ImageData.ImageType.BRIGHTFIELD_H_E);
+                                // Transfer the annotations from the un-normalized image
+                                imageDataNorm.getHierarchy().addObjects(imgFileData.getAnnotationsList());
+                                // Set image to new stain vectors
+                                imageDataNorm.setColorDeconvolutionStains(FINAL_STAINS);
+                                // Save the entry
+                                imageEntryNorm.saveImageData(imageDataNorm);
                             }
 
                         } catch (IOException e){
@@ -332,7 +354,6 @@ public class ImgNormRunner implements Runnable {
                     qupath.setProject(null);
                     qupath.setProject(normProj);
                 });
-
 
                 Platform.runLater(() -> updateTaskProgress(getProgress()*100 + 2, 100));
                 checkAndHandleCancel();
@@ -358,7 +379,7 @@ public class ImgNormRunner implements Runnable {
                 else
                     showInfoMessage("ImgNorm Run Completed", "Run completed! " + time);
 
-                ImgNormImageTools.deleteDirectory(dirManager.getImgTempDir()); // in case previous attempts to delete didn't work
+                ImgNormDirectoryManager.deleteDirectory(dirManager.getImgTempDir()); // in case previous attempts to delete didn't work
 
                 return null;
 
@@ -375,6 +396,67 @@ public class ImgNormRunner implements Runnable {
             }
 
         }
+
+
+        private class ImgFileData {
+            private final File imageFile;
+            private final List<PathObject> annotationsList;
+            private final boolean hasMod;
+            private final String groupID;
+            private static final AtomicInteger modInstancesMade = new AtomicInteger(0);
+
+            public ImgFileData(File imageFile, Collection<PathObject> annotationsCollection) {
+                this.imageFile = imageFile;
+
+                // Convert collection to list
+                List<PathObject> annotationsCollectionAsList = new ArrayList<>(annotationsCollection);
+                // PathObjects include their child objects. Therefore, preprocess each annotation to remove underlying detection objects.
+                annotationsCollectionAsList.replaceAll(annotation -> {
+                    annotation.removeChildObjects(annotation.getChildObjects().stream()
+                            .filter(PathObject::isDetection) // remove detection objects
+                            .toList());
+                    return annotation;
+                });
+
+                this.annotationsList = Collections.unmodifiableList(annotationsCollectionAsList);
+                this.hasMod = annotationsList.stream()
+                        .anyMatch(annotation -> annotation.getPathClass() == PathClass.fromString("Ignore*"));
+
+                this.groupID = this.hasMod ? "_" + modInstancesMade.incrementAndGet() : "";
+            }
+
+            public File getImageFile() {
+                return imageFile;
+            }
+
+            public List<PathObject> getAnnotationsList() {
+                return annotationsList;
+            }
+
+            public boolean isHasMod() {
+                return hasMod;
+            }
+
+            public String getBaseName() {
+                String imageFileName = imageFile.getName();
+                return imageFileName.substring(0, imageFileName.lastIndexOf(".")) + groupID;
+            }
+
+            public String getGroupID() {
+                return groupID;
+            }
+
+            public static void resetModInstancesMade() {
+                modInstancesMade.set(0);
+            }
+
+            @Override
+            public String toString() {
+                return imageFile.toString();
+            }
+
+        }
+
 
         public synchronized void updateTaskProgress(double workDone, double maxWork) {
             updateProgress(workDone, maxWork);
@@ -410,6 +492,15 @@ public class ImgNormRunner implements Runnable {
             }
         }
 
+        class TaskCancelledException extends Exception {
+            public TaskCancelledException(String errorMessage) {
+                super(errorMessage);
+            }
+        }
+
+        /*
+        I can't find Dialogs.showInfoMessage() so might as well make the dialog components from scratch
+         */
         private Label createContentLabel(String text) {
             var label = new Label(text);
             label.setMaxWidth(Double.MAX_VALUE);
@@ -444,12 +535,6 @@ public class ImgNormRunner implements Runnable {
                     .title(title)
                     .content(node)
                     .showAndWait();
-        }
-
-        class TaskCancelledException extends Exception {
-            public TaskCancelledException(String errorMessage) {
-                super(errorMessage);
-            }
         }
 
     }

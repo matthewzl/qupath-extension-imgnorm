@@ -1,59 +1,87 @@
 package qupath.extension.imgnorm;
 
+import org.locationtech.jts.geom.Geometry;
+import qupath.extension.imgnorm.utility.WKTLoader;
 import qupath.lib.common.GeneralTools;
 import qupath.lib.images.ImageData;
 import qupath.lib.images.servers.ImageServer;
 import qupath.lib.images.writers.ImageWriterTools;
 import qupath.lib.objects.PathObject;
 import qupath.lib.objects.PathObjects;
+import qupath.lib.objects.classes.PathClass;
 import qupath.lib.projects.ProjectImageEntry;
 import qupath.lib.regions.ImagePlane;
 import qupath.lib.regions.ImageRegion;
 import qupath.lib.regions.RegionRequest;
+import qupath.lib.roi.GeometryTools;
 import qupath.lib.roi.ROIs;
+import qupath.lib.roi.RoiTools;
 import qupath.lib.roi.interfaces.ROI;
 import qupath.lib.scripting.QP;
+
+import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.*;
 import qupath.lib.images.servers.SparseImageServer;
 import qupath.lib.images.servers.ImageServerProvider;
 import qupath.lib.images.servers.ImageServers;
+
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
+
 import qupath.lib.images.writers.ome.OMEPyramidWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class ImgNormImageTools {
 
-    final static Logger logger = LoggerFactory.getLogger(ImgNormImageTools.class);
+    static final Logger logger = LoggerFactory.getLogger(ImgNormImageTools.class);
     private static final int MAX_REFERENCE_IMAGE_PIXELS = 7000*7000;
+    private static final Geometry watermarkGeometry = WKTLoader.getGeometryFromResource("geometries/watermarks/excludedText.wkt");
+    private static final Geometry watermarkBoundariesGeometry = WKTLoader.getGeometryFromResource("geometries/watermarks/excludedTextBoundaries.wkt");
+    private enum Shading {
+        BLACK, HATCHED, WATERMARKED
+    }
 
-    public static void writeTiles(ProjectImageEntry<BufferedImage> entry, File outputDir, int tileSizePx) throws IOException, InterruptedException {
-        // Get imageData and server associated with the entry
-        ImageData<BufferedImage> entryImageData = entry.readImageData();
-        var server = entryImageData.getServer();
+    public static void writeTiles(ImageData<BufferedImage> imageData, File outputDir, int tileSizePx, String baseName) throws IOException, InterruptedException {
+        // Get server associated with the ImageData
+        var server = imageData.getServer();
 
         // Create tiles
-        PathObject borderAnnotation = makeTileAnnotations(tileSizePx, entryImageData);
+        PathObject borderAnnotation = makeTileAnnotations(tileSizePx, imageData);
         Collection<PathObject> tiles = borderAnnotation.getChildObjects();
 
-//        String imageName = getImageBaseName();
-        String imageName = new File(entry.getURIs().iterator().next()).getName();
-        String imageBaseName = imageName.substring(0, imageName.lastIndexOf(".")); // remove the extension part
-        File subDir = new File(outputDir.getAbsolutePath() + "/" + imageBaseName);
+        File subDir = new File(outputDir.getAbsolutePath() + "/" + baseName);
         subDir.mkdirs();
 
         try {
 
-            try {
-                logger.info("Writing patches for " + imageBaseName + " ...");
+            logger.info("Writing patches for " + baseName + " ...");
+
+            ROI ignoreRoi = RoiTools.union(imageData.getHierarchy().getAnnotationObjects().stream()
+                    .filter(annotation -> annotation.getPathClass() == PathClass.fromString("Ignore*"))
+                    .map(PathObject::getROI)
+                    .toList());
+
+            if (ignoreRoi.getArea() > 0.0) {
+                tiles/*.parallelStream()*/.forEach(tile -> { // TODO: parallelStream？
+                    ROI tileRoi = tile.getROI();
+                    RegionRequest region = RegionRequest.createInstance(server.getPath(), 1, tileRoi);
+                    String outputPath = "[x-" + region.getMinX() + ",y-" + region.getMinY() + ",w-" + region.getWidth() + ",h-" + region.getHeight() + "]";
+                    File file = new File(subDir, outputPath + ".tif");
+                    try {
+                        BufferedImage imgMasked = createMaskedBufferedImageFromRoi(server, tileRoi, ignoreRoi, 1, Shading.WATERMARKED);
+                        ImageWriterTools.writeImage(imgMasked, file.toString()); // checked exception...
+                    } catch (IOException e){
+                        throw new RuntimeException("Error making tiles for " + imageData + " (" + e + ")");
+                    }
+                });
+            } else {
                 tiles/*.parallelStream()*/.forEach(tile -> { // TODO: parallelStream？
                     ROI tileRoi = tile.getROI();
                     RegionRequest region = RegionRequest.createInstance(server.getPath(), 1, tileRoi);
@@ -62,53 +90,43 @@ public class ImgNormImageTools {
                     try {
                         ImageWriterTools.writeImageRegion(server, region, file.toString()); // checked exception...
                     } catch (IOException e){
-                        throw new RuntimeException("Error making tiles for " + entry + " (" + e + ")");
-                    }
-                });
-
-            } catch (OutOfMemoryError oome) {
-                System.gc(); // this probably does nothing...
-                logger.warn(oome + "\nAttempting to write patches again for " + imageBaseName + " ...");
-                tiles.forEach(tile -> { // in this case, no parallelization
-                    ROI tileRoi = tile.getROI();
-                    RegionRequest region = RegionRequest.createInstance(server.getPath(), 1, tileRoi);
-                    String outputPath = "[x-" + region.getMinX() + ",y-" + region.getMinY() + ",w-" + region.getWidth() + ",h-" + region.getHeight() + "]";
-                    File file = new File(subDir, outputPath + ".tif");
-                    try {
-                        ImageWriterTools.writeImageRegion(server, region, file.toString()); // checked exception...
-                    } catch (IOException e){
-                        throw new RuntimeException("Error making tiles for " + entry + " (" + e + ")");
+                        throw new RuntimeException("Error making tiles for " + imageData + " (" + e + ")");
                     }
                 });
             }
 
-            System.gc(); // this probably does nothing...
+            System.gc();
 
             // Generate a downsampled "reference" image for its stain vectors to be estimated later
+            logger.info("Generating reference image...");
             ROI refRoi = borderAnnotation.getROI();
             double downsample = Math.max(1, Math.sqrt(refRoi.getArea()/MAX_REFERENCE_IMAGE_PIXELS));
-            RegionRequest refRegion = RegionRequest.createInstance(server.getPath(), downsample, refRoi);
             File refFile = new File(subDir, "reference.tif");
-            logger.info("Writing reference image...");
-            ImageWriterTools.writeImageRegion(server, refRegion, refFile.toString());
+            if (ignoreRoi.getArea() > 0.0) {
+                BufferedImage refImgMasked = createMaskedBufferedImageFromRoi(server, refRoi, ignoreRoi, downsample, Shading.BLACK);
+                ImageWriterTools.writeImage(refImgMasked, refFile.toString());
+            } else {
+                RegionRequest refRegion = RegionRequest.createInstance(server.getPath(), downsample, refRoi);
+                ImageWriterTools.writeImageRegion(server, refRegion, refFile.toString());
+            }
 
             // Get pixel metadata
             double pixelHeight = (double)server.getPixelCalibration().getPixelHeight();
             double pixelWidth = (double)server.getPixelCalibration().getPixelWidth();
             double zSpacing = (double)server.getPixelCalibration().getZSpacing();
-            double[] downsamples = entry.readImageData().getServer().getMetadata().getPreferredDownsamplesArray();
+            double[] downsamples = server.getMetadata().getPreferredDownsamplesArray();
 
             // Write the metadata into the folder containing the pixel & downsample info
             File metadataFile = new File(subDir, "metadata.txt");
             try (FileWriter metadataWriter = new FileWriter(metadataFile)) {
                 metadataWriter.write("[pH-" + pixelHeight + ",pW-" + pixelWidth + ",zSp-" + zSpacing + ",dsp-" + Arrays.toString(downsamples) + "]");
             } catch (IOException e) {
-                throw new RuntimeException("Error writing metadata for " + entry + " (" + e + ")");
+                throw new RuntimeException("Error writing metadata for " + imageData + " (" + e + ")");
             }
 
         } catch (Exception | OutOfMemoryError e) {
-            deleteDirectory(subDir);
-            throw new RuntimeException("Files for " + imageBaseName + " were removed because of: " + e);
+            ImgNormDirectoryManager.deleteDirectory(subDir);
+            throw new RuntimeException("Files for " + baseName + " were removed because an error occurred: " + e);
         }
 
     }
@@ -164,6 +182,105 @@ public class ImgNormImageTools {
 
     }
 
+
+    /**
+     * Get a BufferedImage within a specified ROI masked by the shape of
+     * another ROI.
+     *
+     * @param server the image server
+     * @param mainRoi the ROI used to get the BufferedImage within
+     * @param maskRoi the ROI used to create the masking
+     * @param downsample downsample
+     * @param shading shading of the mask
+     * @return the BufferedImage
+     * @throws IOException
+     */
+    public static BufferedImage createMaskedBufferedImageFromRoi(
+            ImageServer<BufferedImage> server,
+            ROI mainRoi,
+            ROI maskRoi, // ignore roi
+            double downsample,
+            Shading shading) throws IOException {
+
+        RegionRequest request = RegionRequest.createInstance(server.getPath(), downsample, mainRoi);
+        BufferedImage img = server.readRegion(request);
+
+        ROI maskROIMainIntersection = RoiTools.intersection(maskRoi, mainRoi)
+                .translate(-mainRoi.getBoundsX(), -mainRoi.getBoundsY())
+                .scale(1/downsample, 1/downsample);
+
+        if (maskROIMainIntersection.getArea() == 0) return img;
+
+        switch(shading) {
+            case BLACK -> {
+                Shape maskShape = RoiTools.getShape(maskROIMainIntersection);
+                Graphics2D g2d = img.createGraphics();
+                g2d.setColor(Color.BLACK);
+                g2d.fill(maskShape);
+                g2d.dispose();
+            }
+            case HATCHED -> { // this is much slower
+                Shape maskShape = RoiTools.getShape(maskROIMainIntersection);
+                for (int y = 0; y < img.getHeight(); y++) {
+                    for (int x = 0; x < img.getWidth(); x++) {
+                        if (x % 2 == 0 && y % 2 == 0 /* adjust numbers to change hatching pattern */) continue;
+                        if (!maskShape.contains(x, y)) continue;
+
+                        img.setRGB(x, y, (int) 0xFF000000);
+                    }
+                }
+            }
+            case WATERMARKED -> { // Designed so that passing in tiles of a larger image won't cause watermark misalignment.
+                ROI maskRoiPre = maskRoi.translate(-mainRoi.getBoundsX(), -mainRoi.getBoundsY())
+                        .scale(1/downsample, 1/downsample);
+
+//                Geometry watermarkGeometry = WKTLoader.getGeometryFromResource("geometries/watermarks/excludedText.wkt");
+//                Geometry watermarkBoundariesGeometry = WKTLoader.getGeometryFromResource("geometries/watermarks/excludedTextBoundaries.wkt");
+
+                ROI watermarkRoi = GeometryTools.geometryToROI(watermarkGeometry, ImagePlane.getPlane(0, 0))
+                        .scale(1/downsample, 1/downsample);
+                ROI watermarkBoundariesRoi = GeometryTools.geometryToROI(watermarkBoundariesGeometry, ImagePlane.getPlane(0, 0))
+                        .scale(1/downsample, 1/downsample);
+
+                List<ROI> watermarkRoiList = new ArrayList<>();
+                double watermarkRoiWidth = (watermarkRoi.getBoundsWidth() + watermarkRoi.getBoundsWidth()/10);
+                double watermarkRoiHeight = (watermarkRoi.getBoundsHeight() + watermarkRoi.getBoundsWidth()/10);
+
+//                double maskBoundsX = maskRoiPre.getBoundsX();
+//                double maskBoundsY = maskRoiPre.getBoundsY();
+//                double maskBoundsWidth = maskRoiPre.getBoundsWidth() + 1; // +1 buffer
+//                double maskBoundsHeight = maskRoiPre.getBoundsHeight() + 1; // +1 buffer
+
+                double startX = maskRoiPre.getBoundsX() >= mainRoi.getBoundsX()
+                        ? maskRoiPre.getBoundsX()
+                        : maskRoiPre.getBoundsX() + Math.floor(Math.abs(maskRoiPre.getBoundsX())/watermarkRoiWidth) * watermarkRoiWidth;
+                double startY = maskRoiPre.getBoundsY() >= mainRoi.getBoundsY()
+                        ? maskRoiPre.getBoundsY()
+                        : maskRoiPre.getBoundsY() + Math.floor(Math.abs(maskRoiPre.getBoundsY())/watermarkRoiHeight) * watermarkRoiHeight;
+                double endX = Math.min((maskRoiPre.getBoundsX() + maskRoiPre.getBoundsWidth()), (mainRoi.getBoundsX() + mainRoi.getBoundsWidth()));
+                double endY = Math.min((maskRoiPre.getBoundsY() + maskRoiPre.getBoundsHeight()), (mainRoi.getBoundsY() + mainRoi.getBoundsHeight()));
+                
+                for (double x = startX; x < endX; x += watermarkRoiWidth) {
+                    for (double y = startY; y < endY; y += watermarkRoiHeight) {
+                        if (RoiTools.intersection(watermarkBoundariesRoi.translate(x, y), maskROIMainIntersection).getArea() == 0) continue;
+                        ROI excludedRoiTranslated = watermarkRoi.translate(x, y);
+                        watermarkRoiList.add(excludedRoiTranslated);
+                    }
+                }
+
+                ROI maskRoiFinal = RoiTools.subtract(maskRoiPre, watermarkRoiList);
+                Shape maskShape = RoiTools.getShape(maskRoiFinal);
+
+                Graphics2D g2d = img.createGraphics();
+                g2d.setColor(Color.BLACK);
+                g2d.fill(maskShape);
+                g2d.dispose();
+            }
+        }
+
+        return img;
+    }
+
     /**
      * Stitch the patches and save as an ome.tiff.
      *
@@ -171,7 +288,6 @@ public class ImgNormImageTools {
      * @param outputDir the output directory to write the stitched image
      * @param finalImageSuffix suffix to append to the stitched image name
      * @param deleteOriginalTiles whether to delete the entire directory containing the tiles
-     * @return whether the method ran without exceptions (false = exceptions occurred; true = no exceptions occurred).
      * @throws OutOfMemoryError
      */
     public static void stitchTiles(File patchDirectory, File outputDir, String finalImageSuffix, boolean deleteOriginalTiles)
@@ -250,7 +366,7 @@ public class ImgNormImageTools {
         } finally {
             // TODO: How to guarantee file deletion (issue on Windows)?
             if (deleteOriginalTiles) {
-                deleteDirectory(patchDirectory); // Not strictly needed, but eases the storage load on the computer
+                ImgNormDirectoryManager.deleteDirectory(patchDirectory); // Not strictly needed, but eases the storage load on the computer
             }
         }
 
@@ -262,6 +378,7 @@ public class ImgNormImageTools {
      * @return the annotation objects
      * @throws IOException
      */
+    @Deprecated
     public static Collection<PathObject> getAnnotationObjects(ProjectImageEntry<BufferedImage> entry) throws IOException {
         return entry.readImageData().getHierarchy().getAnnotationObjects();
     }
@@ -335,25 +452,6 @@ public class ImgNormImageTools {
         } else {
             throw new IllegalArgumentException("Pattern not found: " + regex);
         }
-    }
-
-    public static void deleteDirectory(File dir) {
-        Path pathToBeDeleted = dir.toPath();
-
-        logger.info("Attempting to delete " + pathToBeDeleted + " and its contents...");
-
-        try (Stream<Path> walk = Files.walk(pathToBeDeleted)) {
-            walk.sorted(Comparator.reverseOrder())
-                    .map(Path::toFile)
-                    .forEach(file -> {
-                        if (!file.delete()) {
-                            logger.warn("Failed to delete " + file.getAbsolutePath() + " in " + pathToBeDeleted);
-                        }
-                    });
-        } catch (IOException e) {
-            throw new RuntimeException(e.getMessage());
-        }
-
     }
 
 }

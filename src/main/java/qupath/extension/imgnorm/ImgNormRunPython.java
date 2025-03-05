@@ -16,7 +16,7 @@ import org.slf4j.LoggerFactory;
 
 public class ImgNormRunPython {
 
-    final static Logger logger = LoggerFactory.getLogger(ImgNormRunPython.class);
+    static final Logger logger = LoggerFactory.getLogger(ImgNormRunPython.class);
     private Integer inputDirSize;
     private String lastProcessOutputLine = null;
     private final File inputDir;
